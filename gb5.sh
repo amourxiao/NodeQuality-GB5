@@ -8,13 +8,14 @@
 # Repository: https://github.com/amourxiao/NodeQuality-GB5
 # License: GNU Affero General Public License v3.0 (AGPL-3.0)
 
-script_version="v1.0.0"
+script_version="v1.0.1"
 repo_url="https://github.com/amourxiao/NodeQuality-GB5"
 run_cmd="bash <(curl -sL https://github.com/amourxiao/NodeQuality-GB5/raw/main/gb5.sh)"
 
 current_time="$(date +%Y_%m_%d_%H_%M_%S)"
-work_dir=".nodequality_gb5_${current_time}"
 orig_dir="$(pwd)"
+work_base_dir="$orig_dir"
+work_dir=""
 bench_os_url="https://github.com/LloydAsp/NodeQuality/releases/download/v0.0.2/BenchOs.tar.gz"
 
 if uname -m | grep -Eq 'arm|aarch64'; then
@@ -85,7 +86,7 @@ function parse_args() {
                     _red_bold "Error / 错误：指定的工作目录不存在或不可读写 (${opt_dir})！"
                     exit 1
                 fi
-                work_dir="${opt_dir}/${work_dir}"
+                work_base_dir="$opt_dir"
                 ;;
             o)
                 local raw_out="$OPTARG"
@@ -228,33 +229,91 @@ EOF
 }
 
 function pre_init() {
-    mkdir -p "$work_dir" || exit 1
+    work_dir="$(mktemp -d "${work_base_dir}/.nodequality_gb5_${current_time}.XXXXXX")" || exit 1
     cd "$work_dir" || exit 1
-    work_dir="$(pwd)"
+    work_dir="$(readlink -f "$work_dir" 2>/dev/null || pwd -P)"
     work_dir_ready=1
 }
 
-function clear_mount() {
-    swapoff "$work_dir/swap" 2>/dev/null
-    swapoff "$work_dir/BenchOs/.gb5_tmp.swap" 2>/dev/null
+function kill_chroot_procs() {
+    local bench_real="$1"
+    [[ -n "$bench_real" && -d "$bench_real" ]] || return 0
 
-    umount "$work_dir/BenchOs/proc/" 2>/dev/null
-    umount "$work_dir/BenchOs/sys/" 2>/dev/null
-    umount -R "$work_dir/BenchOs/dev/" 2>/dev/null
+    local pid_dir pid root_target killed=0
+    for pid_dir in /proc/[0-9]*; do
+        pid="${pid_dir#/proc/}"
+        [[ "$pid" == "$$" || "$pid" == "$BASHPID" ]] && continue
+        root_target="$(readlink -f "$pid_dir/root" 2>/dev/null)" || continue
+        if [[ "$root_target" == "$bench_real" || "$root_target" == "$bench_real/"* ]]; then
+            kill -TERM "$pid" 2>/dev/null && killed=1
+        fi
+    done
+
+    if [[ "$killed" -eq 1 ]]; then
+        sleep 0.5
+        for pid_dir in /proc/[0-9]*; do
+            pid="${pid_dir#/proc/}"
+            [[ "$pid" == "$$" || "$pid" == "$BASHPID" ]] && continue
+            root_target="$(readlink -f "$pid_dir/root" 2>/dev/null)" || continue
+            if [[ "$root_target" == "$bench_real" || "$root_target" == "$bench_real/"* ]]; then
+                kill -KILL "$pid" 2>/dev/null || true
+            fi
+        done
+        sleep 0.3
+    fi
 }
 
-function pre_cleanup() {
-    clear_mount
-    if [[ "$work_dir" == *"nodequality"* ]]; then
-        rm -rf "${work_dir:?}"/*
-    else
-        echo "$(L err01)"
-        exit 1
+function list_bench_mounts() {
+    local bench_real="$1"
+    [[ -r /proc/mounts ]] || return 2
+    awk -v prefix="$bench_real" '
+        {
+            mp = $2
+            gsub(/\\040/, " ", mp)
+            gsub(/\\011/, "\t", mp)
+            gsub(/\\012/, "\n", mp)
+            gsub(/\\134/, "\\", mp)
+            if (mp == prefix || index(mp, prefix "/") == 1) {
+                printf "%d\t%s\n", length(mp), mp
+            }
+        }
+    ' /proc/mounts | sort -rn -k1,1 | cut -f2-
+}
+
+function clear_mount() {
+    local bench_real
+    bench_real="$(readlink -f "$work_dir/BenchOs" 2>/dev/null || echo "$work_dir/BenchOs")"
+
+    swapoff "$work_dir/swap" 2>/dev/null || true
+    swapoff "$bench_real/.gb5_tmp.swap" 2>/dev/null || true
+
+    kill_chroot_procs "$bench_real"
+
+    local attempt mp remaining
+    for attempt in 1 2 3; do
+        remaining="$(list_bench_mounts "$bench_real")" || return 1
+        [[ -z "$remaining" ]] && return 0
+        while IFS= read -r mp; do
+            [[ -z "$mp" ]] && continue
+            umount "$mp" 2>/dev/null || true
+        done <<<"$remaining"
+        remaining="$(list_bench_mounts "$bench_real")" || return 1
+        [[ -z "$remaining" ]] && return 0
+        sleep 0.5
+    done
+
+    remaining="$(list_bench_mounts "$bench_real")" || return 1
+    if [[ -n "$remaining" ]]; then
+        while IFS= read -r mp; do
+            [[ -z "$mp" ]] && continue
+            umount -l "$mp" 2>/dev/null || true
+        done <<<"$remaining"
+        sleep 0.2
     fi
 }
 
 function load_bench_os() {
-    cd "$work_dir" || exit 1
+    cd "$work_dir" || post_cleanup 1
     rm -rf BenchOs
 
     if ! curl -fL#o BenchOs.tar.gz "$bench_os_url"; then
@@ -267,23 +326,55 @@ function load_bench_os() {
     fi
     rm -f BenchOs.tar.gz
 
-    cd "$work_dir/BenchOs" || post_cleanup 1
+    local bench_dir="$work_dir/BenchOs"
+    cd "$bench_dir" || post_cleanup 1
 
-    if ! mount -t proc /proc proc/ || ! mount --bind /sys sys/ || ! mount --rbind /dev dev/; then
+    if ! mount -t proc proc "$bench_dir/proc" \
+        || ! mount --bind /sys "$bench_dir/sys" \
+        || ! mount --bind /dev "$bench_dir/dev"; then
         _red_bold "$(L err_mount)"
         post_cleanup 1
     fi
-    mount --make-rslave dev 2>/dev/null || true
 
-    rm -f etc/resolv.conf 2>/dev/null
-    cp /etc/resolv.conf etc/resolv.conf 2>/dev/null || true
+    mount --make-private "$bench_dir/proc" 2>/dev/null || true
+    mount --make-rprivate "$bench_dir/sys" 2>/dev/null || mount --make-rslave "$bench_dir/sys" 2>/dev/null || true
+    if mount --make-rprivate "$bench_dir/dev" 2>/dev/null || mount --make-rslave "$bench_dir/dev" 2>/dev/null; then
+        if [[ -d "$bench_dir/dev/shm" ]]; then
+            mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs "$bench_dir/dev/shm" 2>/dev/null || true
+        fi
+    fi
+
+    rm -f "$bench_dir/etc/resolv.conf" 2>/dev/null
+    cp /etc/resolv.conf "$bench_dir/etc/resolv.conf" 2>/dev/null || true
 }
 
 function post_check_mount() {
-    if mount | grep -Fq "$work_dir/BenchOs"; then
+    local bench_real
+    bench_real="$(readlink -f "$work_dir/BenchOs" 2>/dev/null || echo "$work_dir/BenchOs")"
+
+    local remaining
+    if ! remaining="$(list_bench_mounts "$bench_real")"; then
         _red_bold "$(L clean_fail)" | tee "$work_dir/error.log" >&2
         exit 1
     fi
+    if [[ -n "$remaining" ]]; then
+        _red_bold "$(L clean_fail)" | tee "$work_dir/error.log" >&2
+        echo "Remaining mounts:" >&2
+        echo "$remaining" >&2
+        exit 1
+    fi
+
+    local sub host_id bench_id
+    for sub in proc sys dev; do
+        if [[ -e "$bench_real/$sub" ]]; then
+            host_id="$(stat -c '%d:%i' "/$sub" 2>/dev/null)" || { _red_bold "$(L clean_fail)" >&2; exit 1; }
+            bench_id="$(stat -c '%d:%i' "$bench_real/$sub" 2>/dev/null)" || { _red_bold "$(L clean_fail)" >&2; exit 1; }
+            if [[ "$host_id" == "$bench_id" ]]; then
+                _red_bold "$(L clean_fail) (/$sub still bound)" | tee "$work_dir/error.log" >&2
+                exit 1
+            fi
+        fi
+    done
 }
 
 function post_cleanup() {
@@ -296,16 +387,15 @@ function post_cleanup() {
 
     cd "$orig_dir" 2>/dev/null || cd /
 
-    if [[ "$work_dir_ready" -eq 1 ]]; then
+    if [[ "$work_dir_ready" -eq 1 && -n "$work_dir" ]]; then
         if [[ -d "$work_dir/BenchOs" ]]; then
-            chroot "$work_dir/BenchOs" /bin/bash -c "umount -R /dev" &>/dev/null
             clear_mount
             post_check_mount
-            rm -rf "$work_dir/BenchOs"
+            rm -rf --one-file-system "$work_dir/BenchOs" 2>/dev/null || rm -rf "$work_dir/BenchOs"
         fi
 
-        if [[ "$work_dir" == *"nodequality"* ]]; then
-            rm -rf "${work_dir:?}"/
+        if [[ "$(basename "$work_dir")" == .nodequality_gb5_* ]]; then
+            rm -rf --one-file-system "${work_dir:?}" 2>/dev/null || rm -rf "${work_dir:?}"
         else
             echo "$(L err01)"
             exit 1
@@ -535,12 +625,17 @@ function pre_fetch_info() {
 }
 
 function write_worker_script() {
-    mkdir -p "$work_dir/BenchOs/tmp"
+    mkdir -p "$work_dir/BenchOs/tmp" "$work_dir/BenchOs/usr/sbin"
+    cat <<'EOF' > "$work_dir/BenchOs/usr/sbin/policy-rc.d"
+#!/bin/sh
+exit 101
+EOF
+    chmod +x "$work_dir/BenchOs/usr/sbin/policy-rc.d"
     declare -p osinfo meminfo diskinfo > "$work_dir/BenchOs/tmp/nqenv.sh"
 
     cat <<'__GB5_WORKER_EOF__' > "$work_dir/BenchOs/tmp/gb5_worker.sh"
 #!/bin/bash
-script_version="v1.0.0"
+script_version="v1.0.1"
 
 Font_B="\033[1m"
 Font_I="\033[3m"
@@ -873,7 +968,13 @@ show_progress_bar_() {
     local tmplen=$(($2))
     local last_stage=""
     local upload_seen=0
-    while sleep 0.1; do
+    local sleep_pid=""
+    trap '[[ -n "$sleep_pid" ]] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+    while :; do
+        sleep 0.1 &
+        sleep_pid=$!
+        wait "$sleep_pid" 2>/dev/null || exit 0
+        sleep_pid=""
         if ! kill -0 "$main_pid" 2>/dev/null; then
             exit
         fi
@@ -903,7 +1004,12 @@ show_progress_bar_() {
 }
 
 kill_progress_bar() {
-    kill "$bar_pid" 2>/dev/null && echo -ne "\r${Font_LineClear}" 1>&2
+    if [[ -n "$bar_pid" ]]; then
+        kill "$bar_pid" 2>/dev/null
+        wait "$bar_pid" 2>/dev/null
+        bar_pid=""
+    fi
+    echo -ne "\r${Font_LineClear}" 1>&2
 }
 
 adaptoslocale() {
@@ -1134,7 +1240,7 @@ get_virt() {
     local temp_info="${Font_Cyan}${Font_B}${sinfo[virt]}${Font_Suffix}"
     ibar_step=5
     show_progress_bar "$temp_info" $((55 - sinfo[lvirt])) &
-    bar_pid="$!" && disown "$bar_pid"
+    bar_pid="$!"
     trap "kill_progress_bar" RETURN
     [[ -z "${osinfo[virt]}" ]] && osinfo[virt]="$(detect_virt)"
     osinfo[virt_kind]="$(classify_virt_kind "${osinfo[virt]}")"
@@ -1168,7 +1274,7 @@ get_os() {
     local temp_info="${Font_Cyan}${Font_B}${sinfo[os]}${Font_Suffix}"
     ibar_step=15
     show_progress_bar "$temp_info" $((55 - sinfo[los])) &
-    bar_pid="$!" && disown "$bar_pid"
+    bar_pid="$!"
     trap "kill_progress_bar" RETURN
 
     [[ -z "${osinfo[os]}" ]] && osinfo[os]="$(grep '^PRETTY_NAME=' /etc/os-release 2>/dev/null | cut -d= -f2- | tr -d '"')"
@@ -1251,7 +1357,7 @@ get_cpu() {
     local temp_info="${Font_Cyan}${Font_B}${sinfo[cpu]}${Font_Suffix}"
     ibar_step=25
     show_progress_bar "$temp_info" $((55 - sinfo[lcpu])) &
-    bar_pid="$!" && disown "$bar_pid"
+    bar_pid="$!"
     trap "kill_progress_bar" RETURN
 
     local lscpu_out proc_cpuinfo
@@ -1380,6 +1486,8 @@ echo_cpu_temp() {
     declare -A min_temp
     declare -A max_temp
     local interval="${1:-5}"
+    local sleep_pid=""
+    trap '[[ -n "$sleep_pid" ]] && kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
     while :; do
         local found=0 zone type t
         for zone in /sys/class/thermal/thermal_zone*; do
@@ -1426,7 +1534,10 @@ echo_cpu_temp() {
         done
         out="${out% }]"
         echo "$out"
-        sleep "$interval"
+        sleep "$interval" &
+        sleep_pid=$!
+        wait "$sleep_pid" 2>/dev/null || exit 0
+        sleep_pid=""
     done
 }
 
@@ -1553,8 +1664,15 @@ test_cpu_gb5() {
 
     local fd3_open=0 fd4_open=0 test_on=0 test_pid=""
     cleanup_local() {
-        [[ -n "$PROG_BAR_PID" ]] && kill "$PROG_BAR_PID" 2>/dev/null
-        [[ -n "$test_pid" && "$test_on" -eq 1 ]] && kill "$test_pid" 2>/dev/null
+        if [[ -n "$PROG_BAR_PID" ]]; then
+            kill "$PROG_BAR_PID" 2>/dev/null
+            wait "$PROG_BAR_PID" 2>/dev/null
+        fi
+        if [[ -n "$test_pid" && "$test_on" -eq 1 ]]; then
+            kill "$test_pid" 2>/dev/null
+            wait "$test_pid" 2>/dev/null
+            test_on=0
+        fi
         if [[ "$need_swap" -eq 1 ]]; then
             swapoff "$swap_file" 2>/dev/null
             [[ -n "$swap_file" ]] && rm -f "$swap_file"
@@ -1630,7 +1748,11 @@ test_cpu_gb5() {
         cpuinfo[gb_err]="${scpu[gb_fail]}"
     fi
 
-    [[ -n "$test_pid" ]] && kill "$test_pid" 2>/dev/null && test_on=0
+    if [[ -n "$test_pid" && "$test_on" -eq 1 ]]; then
+        kill "$test_pid" 2>/dev/null
+        wait "$test_pid" 2>/dev/null
+        test_on=0
+    fi
     local line item idx val tmin tmax
     while read -r -t 1 line <&3; do
         last_line="$line"
@@ -1662,7 +1784,7 @@ get_mem() {
     local temp_info="${Font_Cyan}${Font_B}${sinfo[mem]}${Font_Suffix}"
     ibar_step=85
     show_progress_bar "$temp_info" $((55 - sinfo[lmem])) &
-    bar_pid="$!" && disown "$bar_pid"
+    bar_pid="$!"
     trap "kill_progress_bar" RETURN
 
     local idx=0 ch line cur size unit val
@@ -1844,7 +1966,7 @@ get_disk() {
     local temp_info="${Font_Cyan}${Font_B}${sinfo[disk]}${Font_Suffix}"
     ibar_step=95
     show_progress_bar "$temp_info" $((55 - sinfo[ldisk])) &
-    bar_pid="$!" && disown "$bar_pid"
+    bar_pid="$!"
     trap "kill_progress_bar" RETURN
 
     if [[ -z "${diskinfo[total]}" || "${diskinfo[total]}" -le 0 ]]; then
@@ -2633,7 +2755,6 @@ function main() {
 
     _green_bold "$(L cleanup_before)"
     pre_init
-    pre_cleanup
 
     _green_bold "$(L loadbench)"
     load_bench_os
